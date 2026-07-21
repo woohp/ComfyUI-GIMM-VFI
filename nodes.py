@@ -5,6 +5,7 @@ from comfy_api.latest import io
 import folder_paths
 import yaml
 import comfy.model_management as mm
+from comfy.model_patcher import ModelPatcher
 from comfy.utils import ProgressBar, load_torch_file
 
 from omegaconf import OmegaConf
@@ -126,7 +127,7 @@ class DownloadAndLoadGIMMVFIModel(io.ComfyNode):
             raft_model = RAFT(raft_args)
             raft_sd = load_torch_file(flow_model_path)
             raft_model.load_state_dict(raft_sd, strict=True)
-            raft_model.to(dtype).to(device)
+            raft_model.to(dtype)
             flow_estimator = raft_model
         elif "gimmvfi_f" in model:
             model = GIMMVFI_F(dtype, config)
@@ -134,19 +135,27 @@ class DownloadAndLoadGIMMVFIModel(io.ComfyNode):
             flowformer = FlowFormer(cfg.latentcostformer)
             flowformer_sd = load_torch_file(flow_model_path)
             flowformer.load_state_dict(flowformer_sd, strict=True)
-            flow_estimator = flowformer.to(dtype).to(device)
+            flow_estimator = flowformer.to(dtype)
             
        
         sd = load_torch_file(model_path)
         model.load_state_dict(sd, strict=False)
       
         model.flow_estimator = flow_estimator
-        model = model.eval().to(dtype).to(device)
+        model = model.eval().to(dtype).to(offload_device)
 
         if torch_compile:
             model = torch.compile(model)
-            
-        return io.NodeOutput(model)
+
+        # Compiled modules should stay on their load device to avoid recompilation
+        # after offloading. Eager models participate in normal ComfyUI offloading.
+        model_offload_device = device if torch_compile else offload_device
+        patcher = ModelPatcher(
+            model,
+            load_device=device,
+            offload_device=model_offload_device,
+        )
+        return io.NodeOutput(patcher)
 
 # region Interpolate
 def _interpolate_schedule(
@@ -158,10 +167,16 @@ def _interpolate_schedule(
     schedule,
     timestep_batch_size=0,
 ):
-    # GIMM-VFI is not managed by ComfyUI's ModelPatcher, so make room by
-    # offloading other managed models before starting its large allocations.
-    mm.unload_all_models()
-    mm.soft_empty_cache()
+    device = gimmvfi_model.load_device
+    chunk_size = timestep_batch_size or len(schedule)
+    frame_bytes = images[0].numel() * images.element_size()
+    workspace = max(
+        mm.minimum_inference_memory(),
+        frame_bytes * (48 + 12 * chunk_size),
+    )
+    mm.load_models_gpu([gimmvfi_model], memory_required=workspace)
+    model = gimmvfi_model.model
+
     images = images.permute(0, 3, 1, 2)
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
@@ -169,8 +184,7 @@ def _interpolate_schedule(
     if images.shape[0] == 1:
         return (images.permute(0, 2, 3, 1).float(), torch.zeros(1, 64, 64, 3))
 
-    device = mm.get_torch_device()
-    dtype = gimmvfi_model.dtype
+    dtype = model.dtype
     output_images = [None] * len(schedule)
     output_flows = [None] * len(schedule) if output_flows else None
     entries_by_pair = [[] for _ in range(images.shape[0] - 1)]
@@ -217,7 +231,7 @@ def _interpolate_schedule(
                     chunk = interpolation_entries[start : start + chunk_size]
                     coordinates = [
                         (
-                            gimmvfi_model.sample_coord_input(
+                            model.sample_coord_input(
                                 model_input.shape[0],
                                 model_input.shape[-2:],
                                 [timestep],
@@ -234,7 +248,7 @@ def _interpolate_schedule(
                         for _, timestep in chunk
                     ]
                     try:
-                        result = gimmvfi_model(
+                        result = model(
                             model_input,
                             coordinates,
                             t=timestep_tensors,
