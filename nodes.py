@@ -136,7 +136,13 @@ class DownloadAndLoadGIMMVFIModel:
 
 # region Interpolate
 def _interpolate_schedule(
-    gimmvfi_model, images, ds_factor, seed, output_flows, schedule
+    gimmvfi_model,
+    images,
+    ds_factor,
+    seed,
+    output_flows,
+    schedule,
+    timestep_batch_size=0,
 ):
     mm.soft_empty_cache()
     images = images.permute(0, 3, 1, 2)
@@ -162,7 +168,7 @@ def _interpolate_schedule(
         else nullcontext()
     )
 
-    with cast_context:
+    with torch.inference_mode(), cast_context:
         for pair, entries in enumerate(tqdm(entries_by_pair)):
             if not entries:
                 pbar.update(1)
@@ -185,51 +191,60 @@ def _interpolate_schedule(
                 model_input = torch.cat(
                     (image_0.unsqueeze(2), image_1.unsqueeze(2)), dim=2
                 ).to(device, non_blocking=True)
-                timesteps = [entry[1] for entry in interpolation_entries]
-                coordinates = [
-                    (
-                        gimmvfi_model.sample_coord_input(
-                            model_input.shape[0],
-                            model_input.shape[-2:],
-                            [timestep],
-                            device=model_input.device,
-                            upsample_ratio=ds_factor,
-                        ),
-                        None,
-                    )
-                    for timestep in timesteps
-                ]
-                timestep_tensors = [
-                    timestep
-                    * torch.ones(model_input.shape[0], device=model_input.device)
-                    for timestep in timesteps
-                ]
-                result = gimmvfi_model(
-                    model_input,
-                    coordinates,
-                    t=timestep_tensors,
-                    ds_factor=ds_factor,
-                )
-                frames = [padder.unpad(frame) for frame in result["imgt_pred"]]
-                flows = [padder.unpad(flow) for flow in result["flowt"]]
+                chunk_size = timestep_batch_size or len(interpolation_entries)
 
-                for index, (output_index, _) in enumerate(interpolation_entries):
-                    output_images[output_index] = (
-                        frames[index][0].detach().cpu().permute(1, 2, 0)
+                for start in range(0, len(interpolation_entries), chunk_size):
+                    chunk = interpolation_entries[start : start + chunk_size]
+                    coordinates = [
+                        (
+                            gimmvfi_model.sample_coord_input(
+                                model_input.shape[0],
+                                model_input.shape[-2:],
+                                [timestep],
+                                device=model_input.device,
+                                upsample_ratio=ds_factor,
+                            ),
+                            None,
+                        )
+                        for _, timestep in chunk
+                    ]
+                    timestep_tensors = [
+                        timestep
+                        * torch.ones(model_input.shape[0], device=model_input.device)
+                        for _, timestep in chunk
+                    ]
+                    result = gimmvfi_model(
+                        model_input,
+                        coordinates,
+                        t=timestep_tensors,
+                        ds_factor=ds_factor,
+                        return_flow_outputs=output_flows is not None,
                     )
-                    if output_flows is not None:
-                        flow_image = flow_to_image(
-                            flows[index]
-                            .squeeze()
-                            .detach()
-                            .cpu()
-                            .permute(1, 2, 0)
-                            .numpy(),
-                            convert_to_bgr=False,
+                    frames = [padder.unpad(frame) for frame in result["imgt_pred"]]
+                    flows = (
+                        [padder.unpad(flow) for flow in result["flowt"]]
+                        if output_flows is not None
+                        else None
+                    )
+
+                    for index, (output_index, _) in enumerate(chunk):
+                        output_images[output_index] = (
+                            frames[index][0].detach().cpu().permute(1, 2, 0)
                         )
-                        output_flows[output_index] = (
-                            torch.from_numpy(flow_image).float() / 255.0
-                        )
+                        if output_flows is not None:
+                            flow_image = flow_to_image(
+                                flows[index]
+                                .squeeze()
+                                .detach()
+                                .cpu()
+                                .permute(1, 2, 0)
+                                .numpy(),
+                                convert_to_bgr=False,
+                            )
+                            output_flows[output_index] = (
+                                torch.from_numpy(flow_image).float() / 255.0
+                            )
+                    del result, frames, flows
 
             pbar.update(1)
 
@@ -269,6 +284,16 @@ class GIMMVFI_interpolate:
                     "BOOLEAN",
                     {"default": False, "tooltip": "Output the flow tensors"},
                 ),
+                "timestep_batch_size": (
+                    "INT",
+                    {
+                        "default": 0,
+                        "min": 0,
+                        "max": 100,
+                        "step": 1,
+                        "tooltip": "Timesteps per pass; 0 is fastest, lower values use less VRAM",
+                    },
+                ),
             },
         }
 
@@ -285,10 +310,17 @@ class GIMMVFI_interpolate:
         interpolation_factor,
         seed,
         output_flows=False,
+        timestep_batch_size=0,
     ):
         schedule = fixed_factor_schedule(images.shape[0], interpolation_factor)
         return _interpolate_schedule(
-            gimmvfi_model, images, ds_factor, seed, output_flows, schedule
+            gimmvfi_model,
+            images,
+            ds_factor,
+            seed,
+            output_flows,
+            schedule,
+            timestep_batch_size,
         )
 
 
@@ -321,6 +353,16 @@ class GIMMVFI_interpolate_fps:
                     "BOOLEAN",
                     {"default": False, "tooltip": "Output one flow image per frame"},
                 ),
+                "timestep_batch_size": (
+                    "INT",
+                    {
+                        "default": 0,
+                        "min": 0,
+                        "max": 100,
+                        "step": 1,
+                        "tooltip": "Timesteps per pass; 0 is fastest, lower values use less VRAM",
+                    },
+                ),
             },
         }
 
@@ -339,10 +381,17 @@ class GIMMVFI_interpolate_fps:
         ds_factor,
         seed,
         output_flows=False,
+        timestep_batch_size=0,
     ):
         schedule = fps_schedule(images.shape[0], source_fps, target_fps)
         return _interpolate_schedule(
-            gimmvfi_model, images, ds_factor, seed, output_flows, schedule
+            gimmvfi_model,
+            images,
+            ds_factor,
+            seed,
+            output_flows,
+            schedule,
+            timestep_batch_size,
         )
 
 

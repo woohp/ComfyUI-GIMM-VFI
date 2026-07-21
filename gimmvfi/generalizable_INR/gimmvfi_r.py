@@ -323,7 +323,15 @@ class GIMMVFI_R(nn.Module):
         other_pred = [img_warp_4]
         return imgt_pred, flowt0_pred, flowt1_pred, other_pred
 
-    def forward(self, img_xs, coord=None, t=None, iters=None, ds_factor=None):
+    def forward(
+        self,
+        img_xs,
+        coord=None,
+        t=None,
+        iters=None,
+        ds_factor=None,
+        return_flow_outputs=True,
+    ):
         assert isinstance(t, list)
         assert isinstance(coord, list)
         assert len(t) == len(coord)
@@ -393,20 +401,25 @@ class GIMMVFI_R(nn.Module):
             )
 
             imgt_preds.append(imgt_pred)
-            flowt0_preds.append(flowt0_pred)
-            flowt1_preds.append(flowt1_pred)
-            all_others.append(others)
+            if return_flow_outputs:
+                flowt0_preds.append(flowt0_pred)
+                flowt1_preds.append(flowt1_pred)
+                all_others.append(others)
 
-        return {
-            "imgt_pred": imgt_preds,
-            "other_pred": all_others,
-            "flowt0_pred": flowt0_preds,
-            "flowt1_pred": flowt1_preds,
-            "raft_flow": preserved_raft_flows,
-            "ninrflow": normal_inr_flows,
-            "nflow": normal_flows,
-            "flowt": flow_t,
-        }
+        result = {"imgt_pred": imgt_preds}
+        if return_flow_outputs:
+            result.update(
+                {
+                    "other_pred": all_others,
+                    "flowt0_pred": flowt0_preds,
+                    "flowt1_pred": flowt1_preds,
+                    "raft_flow": preserved_raft_flows,
+                    "ninrflow": normal_inr_flows,
+                    "nflow": normal_flows,
+                    "flowt": flow_t,
+                }
+            )
+        return result
 
     def warp_frame(self, frame, flow):
         return warp(frame, flow)
