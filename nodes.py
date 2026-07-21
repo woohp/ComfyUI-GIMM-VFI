@@ -174,7 +174,13 @@ def _interpolate_schedule(
         mm.minimum_inference_memory(),
         frame_bytes * (48 + 12 * chunk_size),
     )
-    mm.load_models_gpu([gimmvfi_model], memory_required=workspace)
+    # GIMM-VFI uses standard PyTorch layers and cannot execute with the partial
+    # weight offloading used by ComfyUI's low-VRAM mode.
+    mm.load_models_gpu(
+        [gimmvfi_model],
+        memory_required=workspace,
+        force_full_load=True,
+    )
     model = gimmvfi_model.model
 
     images = images.permute(0, 3, 1, 2)
