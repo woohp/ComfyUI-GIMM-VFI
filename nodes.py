@@ -170,6 +170,7 @@ def _interpolate_schedule(
 
     with torch.inference_mode(), cast_context:
         for pair, entries in enumerate(tqdm(entries_by_pair)):
+            mm.throw_exception_if_processing_interrupted()
             if not entries:
                 pbar.update(1)
                 continue
@@ -194,6 +195,7 @@ def _interpolate_schedule(
                 chunk_size = timestep_batch_size or len(interpolation_entries)
 
                 for start in range(0, len(interpolation_entries), chunk_size):
+                    mm.throw_exception_if_processing_interrupted()
                     chunk = interpolation_entries[start : start + chunk_size]
                     coordinates = [
                         (
