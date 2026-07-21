@@ -158,6 +158,9 @@ def _interpolate_schedule(
     schedule,
     timestep_batch_size=0,
 ):
+    # GIMM-VFI is not managed by ComfyUI's ModelPatcher, so make room by
+    # offloading other managed models before starting its large allocations.
+    mm.unload_all_models()
     mm.soft_empty_cache()
     images = images.permute(0, 3, 1, 2)
     torch.manual_seed(seed)
@@ -207,8 +210,9 @@ def _interpolate_schedule(
                     (image_0.unsqueeze(2), image_1.unsqueeze(2)), dim=2
                 ).to(device, non_blocking=True)
                 chunk_size = timestep_batch_size or len(interpolation_entries)
+                start = 0
 
-                for start in range(0, len(interpolation_entries), chunk_size):
+                while start < len(interpolation_entries):
                     mm.throw_exception_if_processing_interrupted()
                     chunk = interpolation_entries[start : start + chunk_size]
                     coordinates = [
@@ -229,13 +233,26 @@ def _interpolate_schedule(
                         * torch.ones(model_input.shape[0], device=model_input.device)
                         for _, timestep in chunk
                     ]
-                    result = gimmvfi_model(
-                        model_input,
-                        coordinates,
-                        t=timestep_tensors,
-                        ds_factor=ds_factor,
-                        return_flow_outputs=output_flows is not None,
-                    )
+                    try:
+                        result = gimmvfi_model(
+                            model_input,
+                            coordinates,
+                            t=timestep_tensors,
+                            ds_factor=ds_factor,
+                            return_flow_outputs=output_flows is not None,
+                        )
+                    except torch.OutOfMemoryError:
+                        del coordinates, timestep_tensors
+                        mm.soft_empty_cache()
+                        if len(chunk) == 1:
+                            raise
+                        chunk_size = max(1, len(chunk) // 2)
+                        log.warning(
+                            "GIMM-VFI ran out of VRAM; retrying with %d timestep(s) per pass",
+                            chunk_size,
+                        )
+                        continue
+
                     frames = [padder.unpad(frame) for frame in result["imgt_pred"]]
                     flows = (
                         [padder.unpad(flow) for flow in result["flowt"]]
@@ -260,7 +277,8 @@ def _interpolate_schedule(
                             output_flows[output_index] = (
                                 torch.from_numpy(flow_image).float() / 255.0
                             )
-                    del result, frames, flows
+                    start += len(chunk)
+                    del result, frames, flows, coordinates, timestep_tensors
 
             pbar.update(1)
 

@@ -316,8 +316,8 @@ class GIMMVFI_F(nn.Module):
         assert isinstance(coord, list)
         assert len(t) == len(coord)
         full_size_img = None
-        if ds_factor is not None:
-            full_size_img = img_xs.clone()
+        if ds_factor is not None and ds_factor != 1.0:
+            full_size_img = img_xs
             img_xs = torch.cat(
                 [
                     resize(img_xs[:, :, 0], scale_factor=ds_factor).unsqueeze(2),
