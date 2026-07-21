@@ -18,6 +18,7 @@ from .gimmvfi.generalizable_INR.raft import RAFT
 from .gimmvfi.generalizable_INR.flowformer.core.FlowFormer.LatentCostFormer.transformer import FlowFormer
 from .gimmvfi.generalizable_INR.flowformer.configs.submission import get_cfg
 from .gimmvfi.utils.flow_viz import flow_to_image
+from .gimmvfi.utils.frame_schedule import fixed_factor_schedule, fps_schedule
 from .gimmvfi.utils.utils import InputPadder, RaftArgs, easydict_to_dict
 
 from contextlib import nullcontext
@@ -133,129 +134,225 @@ class DownloadAndLoadGIMMVFIModel:
             
         return (model,)
 
-#region Interpolate
-class GIMMVFI_interpolate:
-    @classmethod
-    def INPUT_TYPES(s):
-        return {
-            "required": {
-                "gimmvfi_model": ("GIMMVIF_MODEL",),
-                "images": ("IMAGE", {"tooltip": "The images to interpolate between"}),
-                "ds_factor": ("FLOAT", {"default": 1.0, "min": 0.01, "max": 1.0, "step": 0.01}),
-                "interpolation_factor": ("INT", {"default": 8, "min": 1, "max": 100, "step": 1}),
-                "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
-            },
-            "optional": {
-                "output_flows": ("BOOLEAN", {"default": False, "tooltip": "Output the flow tensors"}),
-            },
-        }
+# region Interpolate
+def _interpolate_schedule(
+    gimmvfi_model, images, ds_factor, seed, output_flows, schedule
+):
+    mm.soft_empty_cache()
+    images = images.permute(0, 3, 1, 2)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
 
-    RETURN_TYPES = ("IMAGE", "IMAGE",)
-    RETURN_NAMES = ("images", "flow_tensors",)
-    FUNCTION = "interpolate"
-    CATEGORY = "PyramidFlowWrapper"
+    if images.shape[0] == 1:
+        return (images.permute(0, 2, 3, 1).float(), torch.zeros(1, 64, 64, 3))
 
-    def interpolate(self, gimmvfi_model, images, ds_factor, interpolation_factor,seed, output_flows=False):
-        mm.soft_empty_cache()
-        images = images.permute(0, 3, 1, 2)
-        torch.manual_seed(seed)
-        torch.cuda.manual_seed(seed)
+    device = mm.get_torch_device()
+    dtype = gimmvfi_model.dtype
+    output_images = [None] * len(schedule)
+    output_flows = [None] * len(schedule) if output_flows else None
+    entries_by_pair = [[] for _ in range(images.shape[0] - 1)]
+    for output_index, (pair, timestep) in enumerate(schedule):
+        entries_by_pair[pair].append((output_index, timestep))
 
-        device = mm.get_torch_device()
-        offload_device = mm.unet_offload_device()
+    pbar = ProgressBar(images.shape[0] - 1)
+    autocast_device = mm.get_autocast_device(device)
+    cast_context = (
+        torch.autocast(device_type=autocast_device, dtype=dtype)
+        if dtype != torch.float32
+        else nullcontext()
+    )
 
-        dtype = gimmvfi_model.dtype
-        
+    with cast_context:
+        for pair, entries in enumerate(tqdm(entries_by_pair)):
+            if not entries:
+                pbar.update(1)
+                continue
 
-        out_images_list = []
-        flows = []
-        start = 0
-        end = images.shape[0] - 1
-        pbar = ProgressBar(images.shape[0] - 1)
+            image_0 = images[pair].unsqueeze(0)
+            image_1 = images[pair + 1].unsqueeze(0)
+            interpolation_entries = []
+            for output_index, timestep in entries:
+                if timestep <= 1e-7:
+                    output_images[output_index] = image_0[0].permute(1, 2, 0).cpu()
+                elif timestep >= 1.0 - 1e-7:
+                    output_images[output_index] = image_1[0].permute(1, 2, 0).cpu()
+                else:
+                    interpolation_entries.append((output_index, timestep))
 
-        autocast_device = mm.get_autocast_device(device)
-        cast_context = torch.autocast(device_type=autocast_device, dtype=dtype) if dtype != torch.float32 else nullcontext()
-
-        with cast_context:
-            for j in tqdm(range(start, end)):
-                I0 = images[j].unsqueeze(0)
-                I2 = images[j+1].unsqueeze(0)
-
-                if j == start:
-                    out_images_list.append(I0.squeeze(0).permute(1, 2, 0))            
-                
-                padder = InputPadder(I0.shape, 32)
-                I0, I2 = padder.pad(I0, I2)
-                xs = torch.cat((I0.unsqueeze(2), I2.unsqueeze(2)), dim=2).to(device, non_blocking=True)
-                
-                batch_size = xs.shape[0]
-                s_shape = xs.shape[-2:]
-            
-                coord_inputs = [
+            if interpolation_entries:
+                padder = InputPadder(image_0.shape, 32)
+                image_0, image_1 = padder.pad(image_0, image_1)
+                model_input = torch.cat(
+                    (image_0.unsqueeze(2), image_1.unsqueeze(2)), dim=2
+                ).to(device, non_blocking=True)
+                timesteps = [entry[1] for entry in interpolation_entries]
+                coordinates = [
                     (
                         gimmvfi_model.sample_coord_input(
-                            batch_size,
-                            s_shape,
-                            [1 / interpolation_factor * i],
-                            device=xs.device,
+                            model_input.shape[0],
+                            model_input.shape[-2:],
+                            [timestep],
+                            device=model_input.device,
                             upsample_ratio=ds_factor,
                         ),
                         None,
                     )
-                    for i in range(1, interpolation_factor)
+                    for timestep in timesteps
                 ]
-                timesteps = [
-                    i * 1 / interpolation_factor * torch.ones(xs.shape[0]).to(xs.device)#.to(torch.float)
-                    for i in range(1, interpolation_factor)
+                timestep_tensors = [
+                    timestep
+                    * torch.ones(model_input.shape[0], device=model_input.device)
+                    for timestep in timesteps
                 ]
-                
-                all_outputs = gimmvfi_model(xs, coord_inputs, t=timesteps, ds_factor=ds_factor)
-                out_frames = [padder.unpad(im) for im in all_outputs["imgt_pred"]]
-                out_flowts = [padder.unpad(f) for f in all_outputs["flowt"]]
-
-                if output_flows:
-                    flowt_imgs = [
-                        flow_to_image(
-                            flowt.squeeze().detach().cpu().permute(1, 2, 0).numpy(),
-                            convert_to_bgr=True,
-                        )
-                        for flowt in out_flowts
-                    ]
-                I1_pred_img = [
-                    (I1_pred[0].detach().cpu().permute(1, 2, 0))
-                    for I1_pred in out_frames
-                ]
-
-                for i in range(interpolation_factor - 1):
-                    out_images_list.append(I1_pred_img[i])
-                    if output_flows:
-                        flows.append(flowt_imgs[i])
-
-                out_images_list.append(
-                    ((padder.unpad(I2)).squeeze().detach().cpu().permute(1, 2, 0))
+                result = gimmvfi_model(
+                    model_input,
+                    coordinates,
+                    t=timestep_tensors,
+                    ds_factor=ds_factor,
                 )
-                pbar.update(1)
-        
-        image_tensors = torch.stack(out_images_list)
-        image_tensors = image_tensors.cpu().float()
+                frames = [padder.unpad(frame) for frame in result["imgt_pred"]]
+                flows = [padder.unpad(flow) for flow in result["flowt"]]
 
-        rgb_images = [cv2.cvtColor(flow, cv2.COLOR_BGR2RGB) for flow in flows]
+                for index, (output_index, _) in enumerate(interpolation_entries):
+                    output_images[output_index] = (
+                        frames[index][0].detach().cpu().permute(1, 2, 0)
+                    )
+                    if output_flows is not None:
+                        flow_image = flow_to_image(
+                            flows[index]
+                            .squeeze()
+                            .detach()
+                            .cpu()
+                            .permute(1, 2, 0)
+                            .numpy(),
+                            convert_to_bgr=False,
+                        )
+                        output_flows[output_index] = (
+                            torch.from_numpy(flow_image).float() / 255.0
+                        )
 
-        if output_flows:
-            flow_tensors = torch.stack([torch.from_numpy(image) for image in rgb_images])
-            flow_tensors = flow_tensors / 255.0
-            flow_tensors = flow_tensors.cpu().float()
-        else:
-            flow_tensors = torch.zeros(1, 64, 64, 3)
+            pbar.update(1)
+
+    image_tensors = torch.stack(output_images).float()
+    if output_flows is None:
+        flow_tensors = torch.zeros(1, 64, 64, 3)
+    else:
+        empty_flow = torch.zeros_like(image_tensors[0])
+        flow_tensors = torch.stack(
+            [flow if flow is not None else empty_flow for flow in output_flows]
+        )
+    return image_tensors, flow_tensors
 
 
-        return (image_tensors, flow_tensors)
+class GIMMVFI_interpolate:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "gimmvfi_model": ("GIMMVIF_MODEL",),
+                "images": ("IMAGE", {"tooltip": "The images to interpolate between"}),
+                "ds_factor": (
+                    "FLOAT",
+                    {"default": 1.0, "min": 0.01, "max": 1.0, "step": 0.01},
+                ),
+                "interpolation_factor": (
+                    "INT",
+                    {"default": 8, "min": 1, "max": 100, "step": 1},
+                ),
+                "seed": (
+                    "INT",
+                    {"default": 0, "min": 0, "max": 0xFFFFFFFFFFFFFFFF},
+                ),
+            },
+            "optional": {
+                "output_flows": (
+                    "BOOLEAN",
+                    {"default": False, "tooltip": "Output the flow tensors"},
+                ),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE", "IMAGE")
+    RETURN_NAMES = ("images", "flow_tensors")
+    FUNCTION = "interpolate"
+    CATEGORY = "PyramidFlowWrapper"
+
+    def interpolate(
+        self,
+        gimmvfi_model,
+        images,
+        ds_factor,
+        interpolation_factor,
+        seed,
+        output_flows=False,
+    ):
+        schedule = fixed_factor_schedule(images.shape[0], interpolation_factor)
+        return _interpolate_schedule(
+            gimmvfi_model, images, ds_factor, seed, output_flows, schedule
+        )
+
+
+class GIMMVFI_interpolate_fps:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "gimmvfi_model": ("GIMMVIF_MODEL",),
+                "images": ("IMAGE", {"tooltip": "The images to interpolate"}),
+                "source_fps": (
+                    "FLOAT",
+                    {"default": 24.0, "min": 0.001, "max": 1000.0, "step": 0.001},
+                ),
+                "target_fps": (
+                    "FLOAT",
+                    {"default": 60.0, "min": 0.001, "max": 1000.0, "step": 0.001},
+                ),
+                "ds_factor": (
+                    "FLOAT",
+                    {"default": 1.0, "min": 0.01, "max": 1.0, "step": 0.01},
+                ),
+                "seed": (
+                    "INT",
+                    {"default": 0, "min": 0, "max": 0xFFFFFFFFFFFFFFFF},
+                ),
+            },
+            "optional": {
+                "output_flows": (
+                    "BOOLEAN",
+                    {"default": False, "tooltip": "Output one flow image per frame"},
+                ),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE", "IMAGE")
+    RETURN_NAMES = ("images", "flow_tensors")
+    FUNCTION = "interpolate_fps"
+    CATEGORY = "PyramidFlowWrapper"
+    DESCRIPTION = "Resample a clip to a target FPS while preserving its duration."
+
+    def interpolate_fps(
+        self,
+        gimmvfi_model,
+        images,
+        source_fps,
+        target_fps,
+        ds_factor,
+        seed,
+        output_flows=False,
+    ):
+        schedule = fps_schedule(images.shape[0], source_fps, target_fps)
+        return _interpolate_schedule(
+            gimmvfi_model, images, ds_factor, seed, output_flows, schedule
+        )
+
 
 NODE_CLASS_MAPPINGS = {
     "DownloadAndLoadGIMMVFIModel": DownloadAndLoadGIMMVFIModel,
     "GIMMVFI_interpolate": GIMMVFI_interpolate,
+    "GIMMVFI_interpolate_fps": GIMMVFI_interpolate_fps,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "DownloadAndLoadGIMMVFIModel": "(Down)Load GIMMVFI Model",
     "GIMMVFI_interpolate": "GIMM-VFI Interpolate",
-    }
+    "GIMMVFI_interpolate_fps": "GIMM-VFI Interpolate (FPS)",
+}
