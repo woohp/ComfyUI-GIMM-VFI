@@ -1,6 +1,7 @@
 import os
 import torch
 
+from comfy_api.latest import io
 import folder_paths
 import yaml
 import comfy.model_management as mm
@@ -30,29 +31,42 @@ log = logging.getLogger(__name__)
 script_directory = os.path.dirname(os.path.abspath(__file__))
 
 
-class DownloadAndLoadGIMMVFIModel:
+class DownloadAndLoadGIMMVFIModel(io.ComfyNode):
     @classmethod
-    def INPUT_TYPES(s):
-        return {
-            "required": {
-                "model": ([
-                    "gimmvfi_r_arb_lpips_fp32.safetensors",
-                    "gimmvfi_f_arb_lpips_fp32.safetensors"
-                    ],),
-               },
-               "optional": {
-                    "precision": (["fp32", "bf16", "fp16"], {"default": "fp32"}),
-                    "torch_compile": ("BOOLEAN", {"default": False, "tooltip": "Compile part of the model with torch.compile, requires Triton"}),
-               },
-        }
+    def define_schema(cls) -> io.Schema:
+        return io.Schema(
+            node_id="DownloadAndLoadGIMMVFIModel",
+            display_name="(Down)Load GIMMVFI Model",
+            category="GIMM-VFI",
+            description="Downloads and loads a GIMM-VFI model.",
+            inputs=[
+                io.Combo.Input(
+                    "model",
+                    options=[
+                        "gimmvfi_r_arb_lpips_fp32.safetensors",
+                        "gimmvfi_f_arb_lpips_fp32.safetensors",
+                    ],
+                ),
+                io.Combo.Input(
+                    "precision",
+                    options=["fp32", "bf16", "fp16"],
+                    default="fp32",
+                    optional=True,
+                ),
+                io.Boolean.Input(
+                    "torch_compile",
+                    default=False,
+                    optional=True,
+                    tooltip="Compile part of the model with torch.compile; requires Triton.",
+                ),
+            ],
+            outputs=[
+                io.Custom("GIMMVIF_MODEL").Output(display_name="gimmvfi_model")
+            ],
+        )
 
-    RETURN_TYPES = ("GIMMVIF_MODEL",)
-    RETURN_NAMES = ("gimmvfi_model",)
-    FUNCTION = "loadmodel"
-    CATEGORY = "GIMM-VFI"
-    DESCRIPTION = "Downloads and loads GIMM-VFI model from folder 'ComfyUI\models\interpolation\gimm-vfi'"
-
-    def loadmodel(self, model, precision="fp32", torch_compile=False):
+    @classmethod
+    def execute(cls, model, precision="fp32", torch_compile=False) -> io.NodeOutput:
 
         device = mm.get_torch_device()
         offload_device = mm.unet_offload_device()
@@ -132,7 +146,7 @@ class DownloadAndLoadGIMMVFIModel:
         if torch_compile:
             model = torch.compile(model)
             
-        return (model,)
+        return io.NodeOutput(model)
 
 # region Interpolate
 def _interpolate_schedule(
@@ -261,51 +275,49 @@ def _interpolate_schedule(
     return image_tensors, flow_tensors
 
 
-class GIMMVFI_interpolate:
+class GIMMVFI_interpolate(io.ComfyNode):
     @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "gimmvfi_model": ("GIMMVIF_MODEL",),
-                "images": ("IMAGE", {"tooltip": "The images to interpolate between"}),
-                "ds_factor": (
-                    "FLOAT",
-                    {"default": 1.0, "min": 0.01, "max": 1.0, "step": 0.01},
+    def define_schema(cls) -> io.Schema:
+        return io.Schema(
+            node_id="GIMMVFI_interpolate",
+            display_name="GIMM-VFI Interpolate",
+            category="PyramidFlowWrapper",
+            inputs=[
+                io.Custom("GIMMVIF_MODEL").Input("gimmvfi_model"),
+                io.Image.Input("images", tooltip="The images to interpolate between"),
+                io.Float.Input(
+                    "ds_factor", default=1.0, min=0.01, max=1.0, step=0.01
                 ),
-                "interpolation_factor": (
-                    "INT",
-                    {"default": 8, "min": 1, "max": 100, "step": 1},
+                io.Int.Input(
+                    "interpolation_factor", default=8, min=1, max=100, step=1
                 ),
-                "seed": (
-                    "INT",
-                    {"default": 0, "min": 0, "max": 0xFFFFFFFFFFFFFFFF},
+                io.Int.Input("seed", default=0, min=0, max=0xFFFFFFFFFFFFFFFF),
+                io.Boolean.Input(
+                    "output_flows",
+                    default=False,
+                    optional=True,
+                    tooltip="Output the flow tensors",
                 ),
-            },
-            "optional": {
-                "output_flows": (
-                    "BOOLEAN",
-                    {"default": False, "tooltip": "Output the flow tensors"},
+                io.Int.Input(
+                    "timestep_batch_size",
+                    default=0,
+                    min=0,
+                    max=100,
+                    step=1,
+                    optional=True,
+                    advanced=True,
+                    tooltip="Timesteps per pass; 0 is fastest, lower values use less VRAM",
                 ),
-                "timestep_batch_size": (
-                    "INT",
-                    {
-                        "default": 0,
-                        "min": 0,
-                        "max": 100,
-                        "step": 1,
-                        "tooltip": "Timesteps per pass; 0 is fastest, lower values use less VRAM",
-                    },
-                ),
-            },
-        }
+            ],
+            outputs=[
+                io.Image.Output(display_name="images"),
+                io.Image.Output(display_name="flow_tensors"),
+            ],
+        )
 
-    RETURN_TYPES = ("IMAGE", "IMAGE")
-    RETURN_NAMES = ("images", "flow_tensors")
-    FUNCTION = "interpolate"
-    CATEGORY = "PyramidFlowWrapper"
-
-    def interpolate(
-        self,
+    @classmethod
+    def execute(
+        cls,
         gimmvfi_model,
         images,
         ds_factor,
@@ -313,9 +325,9 @@ class GIMMVFI_interpolate:
         seed,
         output_flows=False,
         timestep_batch_size=0,
-    ):
+    ) -> io.NodeOutput:
         schedule = fixed_factor_schedule(images.shape[0], interpolation_factor)
-        return _interpolate_schedule(
+        outputs = _interpolate_schedule(
             gimmvfi_model,
             images,
             ds_factor,
@@ -324,58 +336,56 @@ class GIMMVFI_interpolate:
             schedule,
             timestep_batch_size,
         )
+        return io.NodeOutput(*outputs)
 
 
-class GIMMVFI_interpolate_fps:
+class GIMMVFI_interpolate_fps(io.ComfyNode):
     @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "gimmvfi_model": ("GIMMVIF_MODEL",),
-                "images": ("IMAGE", {"tooltip": "The images to interpolate"}),
-                "source_fps": (
-                    "FLOAT",
-                    {"default": 24.0, "min": 0.001, "max": 1000.0, "step": 0.001},
+    def define_schema(cls) -> io.Schema:
+        return io.Schema(
+            node_id="GIMMVFI_interpolate_fps",
+            display_name="GIMM-VFI Interpolate (FPS)",
+            category="PyramidFlowWrapper",
+            description="Resample a clip to a target FPS while preserving its duration.",
+            inputs=[
+                io.Custom("GIMMVIF_MODEL").Input("gimmvfi_model"),
+                io.Image.Input("images", tooltip="The images to interpolate"),
+                io.Float.Input(
+                    "source_fps", default=24.0, min=0.001, max=1000.0, step=0.001
                 ),
-                "target_fps": (
-                    "FLOAT",
-                    {"default": 60.0, "min": 0.001, "max": 1000.0, "step": 0.001},
+                io.Float.Input(
+                    "target_fps", default=60.0, min=0.001, max=1000.0, step=0.001
                 ),
-                "ds_factor": (
-                    "FLOAT",
-                    {"default": 1.0, "min": 0.01, "max": 1.0, "step": 0.01},
+                io.Float.Input(
+                    "ds_factor", default=1.0, min=0.01, max=1.0, step=0.01
                 ),
-                "seed": (
-                    "INT",
-                    {"default": 0, "min": 0, "max": 0xFFFFFFFFFFFFFFFF},
+                io.Int.Input("seed", default=0, min=0, max=0xFFFFFFFFFFFFFFFF),
+                io.Boolean.Input(
+                    "output_flows",
+                    default=False,
+                    optional=True,
+                    tooltip="Output one flow image per frame",
                 ),
-            },
-            "optional": {
-                "output_flows": (
-                    "BOOLEAN",
-                    {"default": False, "tooltip": "Output one flow image per frame"},
+                io.Int.Input(
+                    "timestep_batch_size",
+                    default=0,
+                    min=0,
+                    max=100,
+                    step=1,
+                    optional=True,
+                    advanced=True,
+                    tooltip="Timesteps per pass; 0 is fastest, lower values use less VRAM",
                 ),
-                "timestep_batch_size": (
-                    "INT",
-                    {
-                        "default": 0,
-                        "min": 0,
-                        "max": 100,
-                        "step": 1,
-                        "tooltip": "Timesteps per pass; 0 is fastest, lower values use less VRAM",
-                    },
-                ),
-            },
-        }
+            ],
+            outputs=[
+                io.Image.Output(display_name="images"),
+                io.Image.Output(display_name="flow_tensors"),
+            ],
+        )
 
-    RETURN_TYPES = ("IMAGE", "IMAGE")
-    RETURN_NAMES = ("images", "flow_tensors")
-    FUNCTION = "interpolate_fps"
-    CATEGORY = "PyramidFlowWrapper"
-    DESCRIPTION = "Resample a clip to a target FPS while preserving its duration."
-
-    def interpolate_fps(
-        self,
+    @classmethod
+    def execute(
+        cls,
         gimmvfi_model,
         images,
         source_fps,
@@ -384,9 +394,9 @@ class GIMMVFI_interpolate_fps:
         seed,
         output_flows=False,
         timestep_batch_size=0,
-    ):
+    ) -> io.NodeOutput:
         schedule = fps_schedule(images.shape[0], source_fps, target_fps)
-        return _interpolate_schedule(
+        outputs = _interpolate_schedule(
             gimmvfi_model,
             images,
             ds_factor,
@@ -395,15 +405,4 @@ class GIMMVFI_interpolate_fps:
             schedule,
             timestep_batch_size,
         )
-
-
-NODE_CLASS_MAPPINGS = {
-    "DownloadAndLoadGIMMVFIModel": DownloadAndLoadGIMMVFIModel,
-    "GIMMVFI_interpolate": GIMMVFI_interpolate,
-    "GIMMVFI_interpolate_fps": GIMMVFI_interpolate_fps,
-}
-NODE_DISPLAY_NAME_MAPPINGS = {
-    "DownloadAndLoadGIMMVFIModel": "(Down)Load GIMMVFI Model",
-    "GIMMVFI_interpolate": "GIMM-VFI Interpolate",
-    "GIMMVFI_interpolate_fps": "GIMM-VFI Interpolate (FPS)",
-}
+        return io.NodeOutput(*outputs)
